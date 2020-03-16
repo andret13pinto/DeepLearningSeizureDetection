@@ -3,9 +3,12 @@ import os
 import tensorflow as tf
 import numpy as np
 import pandas as pd
+import time
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.utils import normalize
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
 
 training_data = {"bckg":[]}
 NR_FILES_PER_CLASS = 100
@@ -18,7 +21,7 @@ nr_intervals = 100,
 nr_clases = 5
 
 
-def produce_csv(nr_intervals, nr_classes, csv_path, channel, overlap, window_size):
+def produce_csv2(nr_intervals, nr_classes, csv_path, channel, overlap, window_size):
     """
     The method aims to create a csv file which will support the training of a model
     with a limited amount of data, bearing in mind that each class should have the same
@@ -50,16 +53,17 @@ def produce_csv(nr_intervals, nr_classes, csv_path, channel, overlap, window_siz
             file_data = segmenting.get_training_data_fromFile(s[channel], fs[channel], ann, overlap, window_size)
             for row in file_data:
                 if row[-1] not in training_data.keys():
-                    if len(training_data.keys()) == nr_classes:  # if the number of classes is already fulfilled
-                        continue
-                    else:
-                        training_data[row[-1]] = [row[:-1]]
+                    training_data[row[-1]] = [row[:-1]]
                 else:
                     if len(training_data[row[-1]]) < nr_intervals:  # the number of lists in the list of lists, which is the number of rows
                         training_data[row[-1]].append(row[:-1])
                 lengths = [len(v) for v in training_data.values()]
-                if all(length == nr_intervals for length in lengths) and len(training_data.keys()) == nr_classes:
+                count = len([number for number in lengths if number == nr_intervals])
+                if count == nr_classes:
                     multiple_break = True
+                    for key in list(training_data.keys()):
+                        if len(training_data[key]) < nr_intervals:
+                            del training_data[key]
                     break
             print(lengths)
     new_list = []
@@ -69,12 +73,17 @@ def produce_csv(nr_intervals, nr_classes, csv_path, channel, overlap, window_siz
             new_list.append(row)
     data = np.array(new_list)
     print(data.shape)
-    pd.DataFrame(np.array(new_list)).to_csv("new5class.csv")
+    pd.DataFrame(np.array(new_list)).to_csv("3classx1000sam.csv")
 
+
+def one_hot_enconding(data):
+    columnTransformer = ColumnTransformer([('encoder',OneHotEncoder(), [-1])], remainder='passthrough')
+    data = np.array(columnTransformer.fit_transform(data), dtype=np.str)
+    return data
 
 
 def CNN1():
-    data = pd.read_csv('5class.csv', header=None)
+    data = pd.read_csv('3class.csv', header=None)
     X = data.values[1:,1:-1]  # strip off indexes
     y = data.values[1:,-1]
     X = normalize(X,axis = -1, order = 2)  # L2 norm?
@@ -88,24 +97,25 @@ def CNN1():
     model.summary()
     model.add(layers.Dense(30))
     model.add(layers.Dense(1, activation='sigmoid'))
-
     model.compile(loss="mean_squared_error", optimizer="adam", metrics =['accuracy'])
-
-
     model.fit(X,y,batch_size=20)
 
 
 def fullConnectedModel():
-    data = pd.read_csv('5class.csv', header=None)
-    X = data.values[1:, 1:-1]  # strip off indexes
-    y = data.values[1:, -1]
+    data = pd.read_csv('3classx1000sam.csv', header=None)
+    data = data.values[1:,1:]
+    data = one_hot_enconding(data) # one hot encoding at the beggining of array
+    data = data.astype(np.float)  # convert from string to float
+    X = data[:, 3:]  # strip off indexes
+    y = data[:, 0:3]
     X = normalize(X, axis=-1, order=2)  # L2 norm?
-    X = np.expand_dims(X, axis=2)  # reshape (30, 2560) to (30, 2560, 1)
+    #X = np.expand_dims(X, axis=2)  # reshape (30, 2560) to (30, 2560, 1)
     print(X.shape)
-    print(y)
     model = tf.keras.Sequential()
-    model.dense(50, input_dim = data.shape[1], activation = 'relu')
-    model.dense(5, activation= 'softmax')
+    model.add(layers.Dense(50, input_dim = X.shape[1], activation = 'relu'))
+    model.add(layers.Dense(3, activation= 'softmax'))
+    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    model.fit(X, y, batch_size=32, epochs=20)
+    model.save("3classes-5000samples-{}".format(str(time.time())))
+    return model
 
-
-produce_csv(1000,3,"/Users/andrepinto/Documents/ThesisLeuven/Code/file_information.csv",0, 0.75,2)

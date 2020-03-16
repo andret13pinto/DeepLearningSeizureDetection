@@ -16,7 +16,7 @@ import sys
 from collections import OrderedDict
 
 # gives the path to the sys_tools
-sys.path.insert(1, '/Users/andrepinto/Documents/Thesis:Leuven/Code/nedc_print_labels/sys_tools')
+sys.path.insert(1, '/Users/andrepinto/Documents/ThesisLeuven/Code/nedc_print_labels/sys_tools')
 
 # import required NEDC modules
 #
