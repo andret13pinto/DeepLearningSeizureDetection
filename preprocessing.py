@@ -1,10 +1,14 @@
 import pyedflib
 import nedc_print_labels.sys_tools.nedc_ann_tools as nat
-import nedc_print_labels.sys_tools.nedc_file_tools
 import sys
 import os
 import pandas as pd
 import numpy as np
+from scipy import signal
+from sklearn.preprocessing import LabelEncoder
+import h5py
+from sklearn import preprocessing
+import matplotlib.pyplot as plt
 
 
 def nedc_load_edf(fname_a):
@@ -47,7 +51,7 @@ def nedc_load_edf(fname_a):
 
 def load_annotations(fpath, lev, sub):
     """
-    :param fname: path of the .lbl or .tse file
+    :param fpath: path of the .lbl or .tse file
     :param lev: level in the montage - 0
     :param sub: sublevel in the montage - 0
     :return: list with the intervals of each period and a
@@ -113,98 +117,249 @@ def make_excel_information(filename, folder_path):
     return df.to_excel(filename, index=False)
 
 
-def make_hdf_file(label, csv_file_information, channel):
+def make_h5_file(label, csv_file_information, electrode):
     """
     Method for producting the hdf file
     from the edf files from the TUH-EEG
     dataset
+
     :param label: type of crisis
     :param csv_file_information: path to the csv
      file with the information regarding the signals
-    :param channel:
+    :param electrode: electrode chosen
     :return: produces a hdf file
     """
+    possible_montages = ["EEG" + electrode + "-LE", "EEG" + electrode + "-AR", "EEG" + electrode + "-REF"]
     data = []
-    count = 0
-    file_information = pd.read_csv(csv_file_information)
-    for file in file_information.values[1:]:
-        annot = load_annotations(file[channel], 0, 0)
-        for index in range(len(annot)):  # for each part of signal
-            if label in list(annot[index][2]):
-                sf, s, lbls = nedc_load_edf(os.path.splitext(file[0])[0] + '.edf')
-                init_sample = int(annot[index][0]*sf[channel])
-                end_sample = int(annot[index][1]*sf[channel])
-                signal = s[channel][init_sample:end_sample]
-                signal = signal.tolist()
-                signal.append(sf[channel])
-                data.append(signal)
+    file_info = pd.read_csv(csv_file_information)
+    for f in file_info.values[1:]:
+        ann = load_annotations(f[0], 0, 0)
+        for index in range(len(ann)):  # for each part of signal
+            if label == list(ann[index][2])[0]:
+                sf, s, lbls = nedc_load_edf(os.path.splitext(f[0])[0] + '.edf')
+                channel = [idx for idx in range(len(lbls)) if lbls[idx] in possible_montages]
+                montage = lbls[channel[0]]
+                init_sample = int(ann[index][0]*sf[channel[0]])
+                end_sample = int(ann[index][1]*sf[channel[0]])
+                sign = s[channel[0]][init_sample:end_sample]
+                sign = np.append(sign, sf[channel[0]])
+                data.append(sign)
                 print(len(data))
-                if len(data) > 500:
-                    count = count + 1
-                    data = np.array(data)
-                    pd.DataFrame(data).to_hdf(label + str(count) + "_training.hdf", key='stage', mode='w')
-                    data = []
             else:
                 continue
-    data = np.array(data)
-    if label is 'bckgd':
-        pd.DataFrame(data).to_hdf(label + str(count) +"_training.hdf", key='stage', mode='w')
-    else:
-        pd.DataFrame(data).to_hdf(label + "_training.hdf", key='stage', mode='w')
+    hf = h5py.File('{0}-{1}.h5'.format(label,electrode), 'w')
+    dt = h5py.vlen_dtype(np.dtype('float64'))
+    hf.create_dataset(label, data=data, dtype=dt)
+    hf.close()
 
 
-def read_hdf_file(path):
+def read_h5_file(path, label):
     """
     Reads an hdf file from disk
+
     :param path: path to the file
     :return: numpy.array
     """
-    data = pd.read_hdf(path)
-    return data.values
+    file = h5py.File(path,'r')
+    if label == "bckg":  # account for error naming h5 dataset
+        label = "bckgd"
+    data = file.get(label)
+    return np.array(data)
 
 
-def new_trainingData_csv(list_class, window, overlap, samples_per_class):
+def make_randomized_window_samples(number_samples, Tdata, desired_fs, window):
     """
-    New method to produce the csv to feed into
-    the model. It segments each sample according
-    to the window and overlap chosen.
-    The array procuded will have as many rows determined
-    by the number of classes and samples per class
-    :param list_class: list with all the classes
-    wanted in the data array
-    :param window: size of the window to split the signal
-    into parts
-    :param overlap: overlap between windows
-    :param samples_per_class: number of samples for each class
-    wanted in the data array
-    :return: produces csv file
+    Method to produce infinite samples randomly from the
+    set of intervals provided
+
+    :param number_samples: number of samples wanted
+    :param Tdata: list of complete signals
+    :param desired_fs: sampling frequency wanted
+    :param window: window size for each sample
+    :return: a list with all samples each with (window) window sized
     """
-    overlap = overlap*window
-    signal_dic = {}  # temporary dic just to help counting the number of instances per class
+    samples_list = []
+    while len(samples_list) < number_samples or number_samples is None:
+        print(len(samples_list))
+        random_index = np.random.randint(0, len(Tdata) - 1)  # each time produce different data
+        row = Tdata[random_index]
+        fs = row[-1]
+        if fs != desired_fs:  # resampling the signal into the smallest sample size
+            ratio = int(fs / desired_fs)
+            signal.resample_poly(row, 10, 10 * ratio)
+            fs = desired_fs
+        if len(row) >= window * fs:
+            random_start = np.random.randint(0, len(row) - window * fs)
+        else:
+            continue
+        samples_list.append(row[random_start:random_start + int(window * fs)])
+    return samples_list
+
+
+def make_limited_window_samples(number_samples, Tdata, desired_fs, window, overlap):
+    """
+    Method to produce limited samples from the
+    set of intervals provided
+
+    :param number_samples: number of samples wanted
+    :param Tdata: list of complete signals
+    :param desired_fs: sampling frequency wanted
+    :param window: window size for each sample
+    :param overlap:
+    :return: a list with all samples each with (window) window sized
+    """
+    index = 0
+    samples_list = []
+    break_mode = False
+    for row in Tdata:
+        if break_mode:
+            break
+        fs = list(row).pop(-1)
+        row = row[:-1]
+        if fs != desired_fs:  # resampling the signal into the smallest sample size
+            ratio = int(fs / desired_fs)
+            signal.resample_poly(row, 10, 10 * ratio)
+            fs = desired_fs
+        init = 0
+        end = int(window * fs)
+        while end < len(row):
+            if number_samples is not None:
+                if len(samples_list) == number_samples:
+                    break_mode = True
+                    break
+                else:
+                    samples_list.append(row[init:end])
+                    init = int(init + overlap)
+                    end = int(end + overlap)
+            else:
+                samples_list.append(row[init:end])
+                init = int(init + overlap)
+                end = int(end + overlap)
+    return samples_list
+
+
+def fromDictoArray(dic):
+    """
+    Convert from dictionary with samples,
+    each key with a different class
+    to array with all samples
+    :param dic:  dictionary with samples,
+    each key with a different class
+    :return: array with all samples
+    """
+    temp_list = []
+    for key in dic:
+        ind = list(dic.keys()).index(key)
+        for row in dic[key]:
+            row = np.append(row, ind)
+            temp_list.append(row)
+    return np.array(temp_list)
+
+
+def newData_csv(list_class, window, electrode, samples_per_class = None, desired_fs=250, validation_split=None):
+    """
+    Produces a csv file to provide training data to the algorithm,
+    this data is produced by the make_randomized_window_samples
+    which produces unlimited samples
+
+    :param list_class: list with classes of EEG signal to input into the algorithm
+    :param window: window of signal to classify
+    :param samples_per_class: number of examples per class
+    :param electrode: electrode-name from which the signals have
+    been recorded
+    :param desired_fs: desired sampling frequency of all files
+    :param validation_split: percentage of the data that goes to the validation set, can be None
+    :return: a csv file
+    """
+    base_path = "/Volumes/KESU/Datasets/TUH_EEG_Seizure_Corpus/v1.5.0/edf/train/FP2/"
+    name_tosave_train = "{0}-{1}samp-{2}w-{3}-fs-Training.csv".format(list_class,samples_per_class, window, desired_fs)
+    name_tosave_valid = "{0}-{1}samp-{2}w-{3}-fs-Validation.csv".format(list_class, samples_per_class, window,
+                                                                            desired_fs)
+    signal_dic_train = {}  # temporary dic just to help counting the number of instances per class
+    if validation_split is not None:
+        signal_dic_validation = {}
     for c in list_class:
-        hdf_path = "/Volumes/KESU/Datasets/TUH_EEG_Seizure_Corpus/v1.5.0/edf/train/"
-        signal_dic[c] = []
-        hdf_path = hdf_path + str(c) + "_training.hdf"
-        hdf_data = read_hdf_file(hdf_path)
-        for row in hdf_data:
-            row = row[0] # necessary because of the dimensions
-            fs = row[-1]
-            init = 0
-            end = int(window * fs)
-            nr_samples = len(row)
-            while end < nr_samples and len(signal_dic[c]) < samples_per_class:
-                signal_dic[c].append(row[init:end])
-                init = int(init + overlap*fs)
-                end = int(end + overlap*fs)
-    new_list = []
-    for key in signal_dic.keys():
-        for row in signal_dic[key]:
-            row.append(key)
-            new_list.append(row)
-    data = np.array(new_list)
-    print(data.shape)
-    pd.DataFrame(np.array(new_list)).to_csv(str(len(list_class))+"class-" + str(samples_per_class)+"sam-"+str(window)+"w-"
-                                            +str(overlap)+"ov.csv")
+        print(c)
+        signal_dic_train[c] = []
+        if validation_split is not None:
+            signal_dic_validation[c] = []
+        class_path = base_path + c + "-" + electrode + ".h5"
+        hdf_data = read_h5_file(class_path, c)
+        if validation_split is not None:
+            mask = np.random.choice([False, True], len(hdf_data), p=[1-validation_split, validation_split], replace=True)
+            print(mask)
+            validation_data = hdf_data[mask]
+            training_data = hdf_data[~mask]
+        else:
+            training_data = hdf_data
+        signal_dic_train[c] = make_randomized_window_samples(samples_per_class, training_data, desired_fs, window)
+        print([len(signal_dic_train[k]) for k in signal_dic_train.keys()])
+        if validation_split is not None:
+            signal_dic_validation[c] = make_randomized_window_samples(int(samples_per_class*validation_split), validation_data, desired_fs, window)
+            print([len(signal_dic_validation[k]) for k in signal_dic_validation.keys()])
+    final_Training_data = fromDictoArray(signal_dic_train)
+    final_Validation_data = fromDictoArray(signal_dic_validation)
+    print(final_Training_data[:,-1])
+    print(final_Validation_data[:, -1])
+    np.savetxt(name_tosave_train, final_Training_data, delimiter=',')
+    np.savetxt(name_tosave_valid, final_Validation_data, delimiter=',')
 
 
-new_trainingData_csv(["tnsz","spsz","fnsz"], 2, 0.75, 50)
+def limitedNewData_csv(list_class, window, overlap, electrode, samples_per_class = None, desired_fs=250,validation_split = None):
+    """
+    Produces a csv file to provide training data to the algorithm,
+    this training data is produced by the method
+    make_limited_window_samples which produces as many samples
+    per class as possible if a higher number
+    according to the number of samples_per class wanted
+
+    :param list_class: list with classes of EEG signal to input into the algorithm
+    :param window: window of signal to classify
+    :param overlap: percentage of the window which is overlapped to the next sample
+    :param samples_per_class: number of examples per class
+    :param electrode:  electrode-name from which the signals have
+    been recorded
+    :param desired_fs: desired sampling frequency of all files
+    :param validation_split: percentage of the data that goes to the validation set, can be None
+    :return: csv file with data
+    """
+    base_path = "/Volumes/KESU/Datasets/TUH_EEG_Seizure_Corpus/v1.5.0/edf/train/FP2/"
+    name_tosave_train = "/Volumes/KESU/Datasets/TUH_EEG_Seizure_Corpus/v1.5.0/edf/train/csv_files/" \
+                        "FP2/{0}-{1}samp-{2}w-{3}-fs-TrainingLimited.csv".format(list_class,
+                                                                                 samples_per_class, window, desired_fs)
+    name_tosave_valid = "/Volumes/KESU/Datasets/TUH_EEG_Seizure_Corpus/v1.5.0/edf/train/FP2/csv_files/" \
+                        "{0}-{1}samp-{2}w-{3}-fs-ValidationLimited.csv".format(list_class, samples_per_class, window,
+                                                                        desired_fs)
+    overlap = int(overlap*window)
+    signal_dic_train = {}  # temporary dic just to help counting the number of instances per class
+    if validation_split is not None:
+        signal_dic_validation = {}
+    for c in list_class:
+        print(c)
+        signal_dic_train[c] = []
+        if validation_split is not None:
+            signal_dic_validation[c] = []
+        class_path = base_path + c + "-" + electrode + ".h5"
+        hdf_data = read_h5_file(class_path, c)
+        if validation_split is not None:
+            mask = np.random.choice([False, True], len(hdf_data), p=[1 - validation_split, validation_split],
+                                    replace=True)
+            print(mask)
+            validation_data = hdf_data[mask]
+            training_data = hdf_data[~mask]
+        else:
+            training_data = hdf_data
+        signal_dic_train[c] = make_limited_window_samples(samples_per_class, training_data, desired_fs, window, overlap)
+        print([len(signal_dic_train[k]) for k in signal_dic_train.keys()])
+        if validation_split is not None:
+            if samples_per_class is None:
+                signal_dic_validation[c] = make_limited_window_samples(None,
+                                                                       validation_data, desired_fs, window, overlap)
+            else:
+                signal_dic_validation[c] = make_limited_window_samples(int(samples_per_class * validation_split),
+                                                                       validation_data, desired_fs, window, overlap)
+            print([len(signal_dic_validation[k]) for k in signal_dic_validation.keys()])
+    final_Training_data = fromDictoArray(signal_dic_train)
+    final_Validation_data = fromDictoArray(signal_dic_validation)
+    np.savetxt(name_tosave_train, final_Training_data, delimiter=',')
+    np.savetxt(name_tosave_valid, final_Validation_data, delimiter=',')
